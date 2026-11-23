@@ -15,6 +15,10 @@ class Settings:
     data_dir: str = "./data"
     max_segment_bytes: int = DEFAULT_MAX_SEGMENT_BYTES
     max_read_bytes: int = DEFAULT_MAX_READ_BYTES
+    # 故障注入（默认 0=关闭）：放慢上传的两个阶段，用于稳定复现
+    # "写盘时取消上传"。仅自测/演示使用，生产环境保持默认。
+    put_write_delay: float = 0.0
+    put_commit_delay: float = 0.0
 
     @staticmethod
     def from_env() -> "Settings":
@@ -27,4 +31,6 @@ class Settings:
             max_read_bytes=int(
                 os.environ.get("MAX_READ_BYTES", str(DEFAULT_MAX_READ_BYTES))
             ),
+            put_write_delay=float(os.environ.get("PUT_WRITE_DELAY", "0")),
+            put_commit_delay=float(os.environ.get("PUT_COMMIT_DELAY", "0")),
         )

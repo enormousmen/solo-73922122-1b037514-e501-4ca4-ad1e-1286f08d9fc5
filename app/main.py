@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import FastAPI, Path, Query, Request, Response
 from fastapi.responses import JSONResponse
 
@@ -24,13 +26,17 @@ from .store import (
     NonContiguous,
     ReadOk,
     SegmentStore,
-    SegmentTooLarge,
     EmptySegment,
+    StaleAttempt,
     StartOk,
+    UploadAborted,
 )
 
 REASON_NO_START = "no-independent-start"
 REASON_NO_NEXT = "next-segment-not-written"
+# 非标准但常用的"客户端断连"状态码，仅用于连接仍在时的可观测响应；
+# 真正断连时响应发不出去，处理器至少保证不打印错误堆栈。
+STATUS_CLIENT_CLOSED = 499
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -39,6 +45,8 @@ def create_app(settings: Settings) -> FastAPI:
         slot_count=settings.slot_count,
         max_segment_bytes=settings.max_segment_bytes,
         max_read_bytes=settings.max_read_bytes,
+        put_write_delay=settings.put_write_delay,
+        put_commit_delay=settings.put_commit_delay,
     )
     app = FastAPI(title="segment-recorder", version="0.1.0")
     app.state.store = store
@@ -63,8 +71,41 @@ def create_app(settings: Settings) -> FastAPI:
             body.extend(chunk)
             if len(body) > store.max_segment_bytes:
                 return _too_large(store.max_segment_bytes)
+
+        # ASGI 服务器不会在客户端断连时自动取消正在写盘的请求任务，需要应用
+        # 自己在提交边界探测 http.disconnect；探测到断连即按"提交前取消"处理。
+        # 监听任务预先创建并阻塞在 receive() 上：真实 uvicorn 在断连时投递
+        # http.disconnect；内存型测试传输在请求结束前不会投递任何消息，
+        # 因此用 0 超时轮询——无消息即视为"仍连接"，不会被挂住。
+        async def _watch_disconnect() -> bool:
+            message = await request.receive()
+            return message.get("type") == "http.disconnect"
+
+        disconnect_task = asyncio.ensure_future(_watch_disconnect())
+
+        async def _is_disconnected() -> bool:
+            if not disconnect_task.done():
+                return False
+            try:
+                return disconnect_task.result()
+            except asyncio.CancelledError:
+                return False
+
         try:
-            result = await store.put(seq=seq, independent=independent, data=bytes(body))
+            result = await store.put(
+                seq=seq,
+                independent=independent,
+                data=bytes(body),
+                is_disconnected=_is_disconnected,
+            )
+        except asyncio.CancelledError:
+            # 写盘期间协程被事件循环取消：覆盖未提交（或已在 shield 内完整
+            # 提交），连接既已断开，无需也无法再写 HTTP 响应，结束请求即可。
+            raise
+        except UploadAborted:
+            # 写盘期间探测到客户端断连、覆盖尚未提交。连接多半已不可写；
+            # 即便仍可写，也返回 499 表明上传被放弃，库内状态未变。
+            return Response(status_code=STATUS_CLIENT_CLOSED)
         except EmptySegment:
             return JSONResponse(status_code=400, content={"detail": "empty segment body"})
         except NonContiguous as exc:
@@ -76,6 +117,16 @@ def create_app(settings: Settings) -> FastAPI:
                     "got_seq": exc.got,
                 },
             )
+        except StaleAttempt as exc:
+            # 迟到的覆盖提交被作废：槽位已被更新的尝试占用，本次结果以库里
+            # 现有内容为准，客户端无需处理（重试成功的那一次已经生效）。
+            return JSONResponse(
+                status_code=409,
+                content={"detail": str(exc), "reason": "stale-commit-discarded"},
+            )
+        finally:
+            # 请求离开写盘路径后回收断连监听任务，避免悬挂的 receive() 协程。
+            disconnect_task.cancel()
         return {
             "seq": result.seq,
             "slot": result.slot,

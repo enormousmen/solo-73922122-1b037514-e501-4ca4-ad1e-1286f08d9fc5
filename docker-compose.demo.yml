@@ -1,0 +1,8 @@
+services:
+  recorder:
+    environment:
+      # 故障注入（仅演示用）：放慢上传的"临时文件写盘"与"提交"两个阶段，
+      # 让 demo-cancel-retry.sh 能稳定复现"写盘时取消上传"的两种时序。
+      # 正常部署不要使用本文件；默认 docker-compose.yml 不含这些变量。
+      PUT_WRITE_DELAY: "1"
+      PUT_COMMIT_DELAY: "1"

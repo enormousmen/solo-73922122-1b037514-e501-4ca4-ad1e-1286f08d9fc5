@@ -280,3 +280,61 @@ def test_disk_slots_do_not_grow(client, tmp_path):
     assert sorted(p.name for p in files) == [
         f"slot_{i:04d}.seg" for i in range(SLOT_COUNT)
     ]
+
+
+# ---- 写盘期间客户端断连（HTTP 层断连探测） ----
+
+
+def test_disconnect_before_commit_aborts_overwrite_and_retry_wins(client, tmp_path):
+    """客户端在覆盖提交前断连：覆盖放弃、旧片有效，同片号重试成功并生效。"""
+    import asyncio
+
+    from app.store import UploadAborted
+
+    store = client.app.state.store
+    for s in range(1, 5):
+        assert upload(client, s, independent=(s == 1)).status_code == 201
+
+    # 注入"已断连"探测：本次上传在提交边界必须放弃，不产生覆盖。
+    async def disconnected():
+        return True
+
+    with pytest.raises(UploadAborted):
+        asyncio.run(store.put(5, False, seg_bytes(5), is_disconnected=disconnected))
+
+    st = client.get("/v1/state").json()
+    assert st["newest_seq"] == 4 and st["slots"][0]["seq"] == 1
+    # 旧游标仍读到片 1；磁盘无临时文件残留。
+    cursor = start_ok(client, 1)
+    r = read(client, cursor)
+    assert r.status_code == 200 and r.headers["x-seq"] == "1"
+    files = list((tmp_path / "data").iterdir())
+    assert len(files) == SLOT_COUNT and all(p.name.endswith(".seg") for p in files)
+
+    # 同片号重试立即成功并完成覆盖，回看字节即重试内容。
+    assert upload(client, 5, independent=True).status_code == 201
+    cursor = start_ok(client, 5)
+    buf = bytearray()
+    while True:
+        r = read(client, cursor)
+        if r.status_code != 200:
+            break
+        buf += r.content
+        cursor = r.headers["x-next-cursor"]
+        if r.headers["x-end-of-segment"] == "true":
+            break
+    assert bytes(buf) == seg_bytes(5)
+
+
+def test_connected_client_is_not_aborted_by_probe(client):
+    """探测回调在仍连接时返回 False：正常上传不受影响（防探测误伤）。"""
+    import asyncio
+
+    store = client.app.state.store
+
+    async def connected():
+        return False
+
+    result = asyncio.run(store.put(1, True, seg_bytes(1), is_disconnected=connected))
+    assert result.seq == 1 and result.newest_seq == 1
+    assert upload(client, 2).status_code == 201  # 连续性未被探测破坏
